@@ -17,7 +17,7 @@ async def connect_to_mongo():
 async def close_mongo_connection():
     """Close database connection."""
     if mongodb.client:
-        mongodb.client.close()
+        await mongodb.client.close()
         print("Disconnected from MongoDB")
 
 def get_database():

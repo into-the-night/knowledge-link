@@ -51,6 +51,18 @@ export const linksAPI = {
       throw error.response?.data || error;
     }
   },
+
+  // Search links
+  searchLinks: async (query, limit = 10) => {
+    try {
+      const response = await api.get('/search', {
+        params: { q: query, limit }
+      });
+      return response.data;
+    } catch (error) {
+      throw error.response?.data || error;
+    }
+  },
 };
 
 export default linksAPI;
