@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, Depends
 from typing import List, Optional
 from datetime import datetime
 import asyncio
@@ -9,24 +9,26 @@ from app.utils.database import get_database
 from app.routes.models import LinkCreate, LinkResponse, SearchResult
 from app.services.link_service import fetch_page_metadata, scrape_and_process_link
 from app.utils.vector_db import content_processor
+from app.routes.auth import get_current_user
 
 
 router = APIRouter()
 
 
 @router.post("/links", response_model=LinkResponse, status_code=status.HTTP_201_CREATED)
-async def create_link(link: LinkCreate):
+async def create_link(link: LinkCreate, current_user: dict = Depends(get_current_user)):
     """Save a new link and trigger background processing for scraping and embedding."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     db = get_database()
     
     # Convert URL to string for storage
     link_dict = link.dict()
     link_dict["url"] = str(link.url)
     
-    # For now, user_id can be passed in the request or defaulted
-    # When auth is implemented, this will come from the authenticated user
-    if not link_dict.get("user_id"):
-        link_dict["user_id"] = "default_user"
+    # Use the authenticated user's ID
+    link_dict["user_id"] = current_user["id"]
     
     # Try to fetch initial metadata if not provided
     if not link_dict.get("title") or not link_dict.get("description"):
@@ -65,18 +67,16 @@ async def create_link(link: LinkCreate):
 async def get_links(
     skip: int = Query(0, ge=0, description="Number of links to skip"),
     limit: int = Query(100, ge=1, le=100, description="Number of links to return"),
-    user_id: Optional[str] = Query(None, description="User ID (temporary until auth is implemented)")
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get all links for the user."""
+    """Get all links for the authenticated user."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     db = get_database()
     
-    # Build query filter
-    query_filter = {}
-    if user_id:
-        query_filter["user_id"] = user_id
-    else:
-        # Default user for now
-        query_filter["user_id"] = "default_user"
+    # Build query filter - only get links for the authenticated user
+    query_filter = {"user_id": current_user["id"]}
     
     links = []
     cursor = db[settings.COLLECTION_NAME].find(query_filter).skip(skip).limit(limit).sort("created_at", -1)
@@ -93,9 +93,12 @@ async def search_links(
     q: str = Query(..., description="Search query"),
     limit: int = Query(10, ge=1, le=50, description="Maximum number of results"),
     similarity_threshold: float = Query(0.7, ge=0.0, le=1.0, description="Minimum similarity score"),
-    user_id: Optional[str] = Query(None, description="User ID (temporary until auth is implemented)")
+    current_user: dict = Depends(get_current_user)
 ):
     """Search links using vector similarity search."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     try:
         if not settings.GEMINI_API_KEY:
             raise HTTPException(
@@ -103,16 +106,12 @@ async def search_links(
                 detail="Vector search is not available. Gemini API key not configured."
             )
         
-        # Default user for now
-        if not user_id:
-            user_id = "default_user"
-        
-        # Perform vector search
+        # Perform vector search for the authenticated user's links
         results = await content_processor.search_content(
             query=q,
             limit=limit,
             similarity_threshold=similarity_threshold,
-            user_id=user_id
+            user_id=current_user["id"]
         )
         
         return results

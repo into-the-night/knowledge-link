@@ -19,6 +19,19 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// Add response interceptor to handle auth errors
+api.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 401) {
+      // Clear token and redirect to login
+      localStorage.removeItem('token');
+      window.location.href = '/';
+    }
+    return Promise.reject(error);
+  }
+);
+
 export const linksAPI = {
   // Create a new link
   createLink: async (linkData) => {
@@ -129,5 +142,10 @@ export const authAPI = {
     return null;
   },
 };
+
+// Export wrapper functions for backwards compatibility
+export const createLink = linksAPI.createLink;
+export const fetchLinks = () => linksAPI.getLinks();
+export const searchLinks = (query, limit) => linksAPI.searchLinks(query, limit);
 
 export default { linksAPI, authAPI };
