@@ -5,31 +5,53 @@ import asyncio
 from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING
 
-from database import get_database
-from config import settings
-from models import LinkEmbedding, SearchResult, LinkResponse
-from embeddings import ensure_embedding_service
+from app.utils.database import get_database
+from app.config.config import settings
+from app.routes.models import SearchResult, LinkResponse
+from app.services.embeddings import ensure_embedding_service
 
 
 class VectorDatabase:
     """Vector database operations for MongoDB."""
     
-    def __init__(self):
+    def __init__(self): 
         self.collection_name = settings.VECTOR_COLLECTION_NAME
     
     async def create_vector_index(self):
-        """Create vector search index for MongoDB Atlas."""
+        """Create vector search index for MongoDB Atlas.
+        
+        Note: The actual vector search index must be created in MongoDB Atlas UI or via API.
+        This method creates supporting indexes.
+        
+        Vector Search Index Definition (create in Atlas UI):
+        {
+          "fields": [{
+            "type": "vector",
+            "path": "embedding",
+            "numDimensions": 768,
+            "similarity": "cosine"
+          }]
+        }
+        """
         db = get_database()
         collection = db[self.collection_name]
         
         try:
-            # Create a text index for basic search functionality
+            # Create supporting indexes for filtering and sorting
             await collection.create_index([
                 ("link_id", ASCENDING),
-                ("metadata.url", ASCENDING),
+                ("user_id", ASCENDING),
                 ("created_at", DESCENDING)
             ])
-            print(f"Created indexes for {self.collection_name}")
+            
+            # Create compound index for user-specific queries
+            await collection.create_index([
+                ("user_id", ASCENDING),
+                ("link_id", ASCENDING)
+            ])
+            
+            print(f"Created supporting indexes for {self.collection_name}")
+            print("Note: Create vector search index in MongoDB Atlas UI with name 'vector_index'")
         except Exception as e:
             print(f"Error creating indexes: {e}")
     
@@ -38,7 +60,8 @@ class VectorDatabase:
         link_id: str, 
         content_chunks: List[str], 
         embeddings: List[List[float]],
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
+        user_id: Optional[str] = None
     ) -> bool:
         """
         Store embeddings for a link's content chunks.
@@ -72,6 +95,7 @@ class VectorDatabase:
                 if embedding:  # Only store non-null embeddings
                     doc = {
                         "link_id": link_id,
+                        "user_id": user_id,
                         "chunk_index": i,
                         "content_chunk": chunk,
                         "embedding": embedding,
@@ -97,16 +121,16 @@ class VectorDatabase:
         query_embedding: List[float], 
         limit: int = 10,
         similarity_threshold: float = 0.7,
-        link_ids: Optional[List[str]] = None
+        user_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar content using vector similarity.
+        Search for similar content using MongoDB Atlas Vector Search.
         
         Args:
             query_embedding: Embedding vector of the search query
             limit: Maximum number of results
             similarity_threshold: Minimum similarity score
-            link_ids: Optional list of link IDs to restrict search
+            user_id: Optional user ID to filter results
             
         Returns:
             List of matching documents with similarity scores
@@ -118,35 +142,60 @@ class VectorDatabase:
         collection = db[self.collection_name]
         
         try:
-            # Build query filter
-            query_filter = {}
-            if link_ids:
-                query_filter["link_id"] = {"$in": link_ids}
+            # Build the vector search aggregation pipeline
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "vector_index",  # Index name created in Atlas UI
+                        "path": "embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": limit * 10,  # Cast a wider net for better results
+                        "limit": limit * 3  # Get more results to group by link later
+                    }
+                },
+                {
+                    "$addFields": {
+                        "similarity_score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
             
-            # Fetch all embeddings (for now, until MongoDB Atlas vector search is available)
-            cursor = collection.find(query_filter).limit(1000)  # Reasonable limit
+            # Add user filter if provided
+            if user_id:
+                pipeline.append({
+                    "$match": {"user_id": user_id}
+                })
             
-            results = []
-            async for doc in cursor:
-                if "embedding" in doc and doc["embedding"]:
-                    # Calculate similarity
-                    similarity = await self._calculate_similarity(
-                        query_embedding, 
-                        doc["embedding"]
-                    )
-                    
-                    if similarity >= similarity_threshold:
-                        doc["similarity_score"] = similarity
-                        results.append(doc)
+            # Filter by similarity threshold
+            pipeline.append({
+                "$match": {
+                    "similarity_score": {"$gte": similarity_threshold}
+                }
+            })
             
-            # Sort by similarity score (highest first)
-            results.sort(key=lambda x: x["similarity_score"], reverse=True)
+            # Sort by similarity score
+            pipeline.append({
+                "$sort": {"similarity_score": -1}
+            })
             
-            return results[:limit]
+            # Limit final results
+            pipeline.append({"$limit": limit * 3})
+            
+            # Execute the aggregation pipeline
+            cursor = await collection.aggregate(pipeline)
+            results = await cursor.to_list(None)
+            
+            return results
             
         except Exception as e:
-            print(f"Error searching embeddings: {e}")
-            return []
+            print(f"Error in vector search: {e}")
+            print("Note: Ensure vector search index 'vector_index' exists in MongoDB Atlas")
+            print("Falling back to local similarity search...")
+            
+            # Fallback to local similarity calculation if vector search fails
+            return await self._fallback_similarity_search(
+                query_embedding, limit, similarity_threshold, user_id
+            )
     
     async def get_embeddings_by_link(self, link_id: str) -> List[Dict[str, Any]]:
         """Get all embeddings for a specific link."""
@@ -208,6 +257,43 @@ class VectorDatabase:
             print(f"Error getting vector database statistics: {e}")
             return {}
     
+    async def _fallback_similarity_search(
+        self,
+        query_embedding: List[float],
+        limit: int,
+        similarity_threshold: float,
+        user_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Fallback to local similarity calculation if Atlas Vector Search is not available."""
+        db = get_database()
+        collection = db[self.collection_name]
+        
+        # Build query filter
+        query_filter = {}
+        if user_id:
+            query_filter["user_id"] = user_id
+        
+        # Fetch embeddings
+        cursor = collection.find(query_filter).limit(1000)
+        
+        results = []
+        async for doc in cursor:
+            if "embedding" in doc and doc["embedding"]:
+                # Calculate similarity locally
+                similarity = await self._calculate_similarity(
+                    query_embedding, 
+                    doc["embedding"]
+                )
+                
+                if similarity >= similarity_threshold:
+                    doc["similarity_score"] = similarity
+                    results.append(doc)
+        
+        # Sort by similarity score
+        results.sort(key=lambda x: x["similarity_score"], reverse=True)
+        
+        return results[:limit]
+    
     @staticmethod
     async def _calculate_similarity(vec1: List[float], vec2: List[float]) -> float:
         """Calculate cosine similarity between two vectors."""
@@ -244,7 +330,8 @@ class ContentProcessor:
         self, 
         link_id: str, 
         content: str,
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
+        user_id: Optional[str] = None
     ) -> bool:
         """
         Process link content and store embeddings.
@@ -263,7 +350,7 @@ class ContentProcessor:
         
         try:
             # Import chunking function
-            from scraper import chunk_text
+            from app.services.scraper import chunk_text
             
             # Split content into chunks
             chunks = chunk_text(content, chunk_size=1000, overlap=200)
@@ -296,7 +383,8 @@ class ContentProcessor:
                 link_id=link_id,
                 content_chunks=valid_chunks,
                 embeddings=valid_embeddings,
-                metadata=metadata
+                metadata=metadata,
+                user_id=user_id
             )
             
             return success
@@ -309,7 +397,8 @@ class ContentProcessor:
         self, 
         query: str, 
         limit: int = 10,
-        similarity_threshold: float = 0.7
+        similarity_threshold: float = 0.7,
+        user_id: Optional[str] = None
     ) -> List[SearchResult]:
         """
         Search for content similar to the query.
@@ -334,18 +423,19 @@ class ContentProcessor:
                 print("Failed to generate query embedding")
                 return []
             
-            # Search for similar content
+            # Search for similar content using MongoDB Atlas Vector Search
             similar_docs = await self.vector_db.search_similar_content(
                 query_embedding=query_embedding,
                 limit=limit * 3,  # Get more to group by link
-                similarity_threshold=similarity_threshold
+                similarity_threshold=similarity_threshold,
+                user_id=user_id
             )
             
             if not similar_docs:
                 return []
             
             # Group results by link and get link details
-            from database import get_database
+            from app.utils.database import get_database
             db = get_database()
             links_collection = db[settings.COLLECTION_NAME]
             

@@ -2,9 +2,8 @@ import asyncio
 from typing import List, Optional, Tuple
 import numpy as np
 from google import genai
-from google.genai import types
 
-from config import settings
+from app.config.config import settings
 
 
 class EmbeddingService:

@@ -1,0 +1,3 @@
+"""
+KnowledgeLink backend application package.
+"""

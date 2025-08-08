@@ -60,3 +60,4 @@ frontend/build/
 backend/.venv/
 backend/venv/
 backend/__pycache__/
+backend/.sessions/

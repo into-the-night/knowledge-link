@@ -1,6 +1,6 @@
 from pymongo import AsyncMongoClient
 from typing import Optional
-from config import settings
+from app.config.config import settings
 
 class MongoDB:
     client: Optional[AsyncMongoClient] = None
